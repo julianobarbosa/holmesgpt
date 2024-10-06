@@ -6,7 +6,9 @@ if add_custom_certificate(ADDITIONAL_CERTIFICATE):
     print("added custom certificate")
 
 # DO NOT ADD ANY IMPORTS OR CODE ABOVE THIS LINE
-# IMPORTING ABOVE MIGHT INITIALIZE AN HTTPS CLIENT THAT DOESN'T TRUST THE CUSTOM CERTIFICATEE
+# IMPORTING ABOVE MIGHT INITIALIZE AN HTTPS CLIENT THAT DOESN'T TRUST THE CUSTOM CERTIFICATE
+
+
 import jinja2
 import logging
 import uvicorn
@@ -15,7 +17,7 @@ import colorlog
 from typing import Dict, Callable
 from litellm.exceptions import AuthenticationError
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import SecretStr
 from rich.console import Console
 
 from holmes.common.env_vars import (
@@ -38,9 +40,8 @@ from holmes.core.models import (
     ConversationInvestigationResult,
     ToolCallConversationResult,
 )
-from holmes.plugins.prompts import load_prompt
+from holmes.plugins.prompts import load_and_render_prompt
 from holmes.core.tool_calling_llm import ToolCallingLLM
-import jinja2
 
 
 def init_logging():
@@ -69,9 +70,16 @@ console = Console()
 config = Config.load_from_env()
 
 
+def load_robusta_api_key():
+    if os.environ.get("ROBUSTA_AI"):
+        account_id, token = dal.get_ai_credentials()
+        config.api_key = SecretStr(f"{account_id} {token}")
+
+
 @app.post("/api/investigate")
 def investigate_issues(investigate_request: InvestigateRequest):
     try:
+        load_robusta_api_key()
         context = dal.get_issue_data(
             investigate_request.context.get("robusta_issue_id")
         )
@@ -95,7 +103,7 @@ def investigate_issues(investigate_request: InvestigateRequest):
         )
         investigation = ai.investigate(
             issue,
-            prompt=load_prompt(investigate_request.prompt_template),
+            prompt=investigate_request.prompt_template,
             console=console,
             post_processing_prompt=HOLMES_POST_PROCESSING_PROMPT,
             instructions=instructions,
@@ -112,7 +120,7 @@ def investigate_issues(investigate_request: InvestigateRequest):
 
 @app.post("/api/workload_health_check")
 def workload_health_check(request: WorkloadHealthRequest):
-
+    load_robusta_api_key()
     try:
         resource = request.resource
         workload_alerts: list[str] = []
@@ -128,7 +136,7 @@ def workload_health_check(request: WorkloadHealthRequest):
         if instructions:
             request.ask = f"{request.ask}\n My instructions for the investigation '''{nl.join(instructions)}'''"
 
-        system_prompt = load_prompt(request.prompt_template)
+        system_prompt = load_and_render_prompt(request.prompt_template)
         system_prompt = jinja2.Environment().from_string(system_prompt)
         system_prompt = system_prompt.render(alerts=workload_alerts)
 
@@ -149,10 +157,8 @@ def workload_health_check(request: WorkloadHealthRequest):
 def handle_issue_conversation(
     conversation_request: ConversationRequest, ai: ToolCallingLLM
 ):
-    context_window = ai.get_context_window_size()
-    system_prompt = load_prompt("builtin://generic_ask_for_issue_conversation.jinja2")
-    system_prompt_template = jinja2.Environment().from_string(system_prompt)
-    
+    load_robusta_api_key()
+    context_window = ai.get_context_window_size()    
     number_of_tools = len(
         conversation_request.context.investigation_result.tools
     ) + sum(
@@ -167,7 +173,7 @@ def handle_issue_conversation(
         "tools_called_for_investigation": conversation_request.context.investigation_result.tools,
         "conversation_history": conversation_request.context.conversation_history,
     }
-        system_prompt = system_prompt_template.render(**template_context)
+        system_prompt = load_and_render_prompt("builtin://generic_ask_for_issue_conversation.jinja2", template_context)
         return system_prompt
 
     conversation_history_without_tools = [
@@ -182,7 +188,7 @@ def handle_issue_conversation(
         "tools_called_for_investigation": None,
         "conversation_history": conversation_history_without_tools,
     }
-    system_prompt = system_prompt_template.render(**template_context)
+    system_prompt = load_and_render_prompt("builtin://generic_ask_for_issue_conversation.jinja2", template_context)
     messages = [
         {
             "role": "system",
@@ -194,9 +200,10 @@ def handle_issue_conversation(
         },
     ]
     message_size_without_tools = ai.count_tokens_for_message(messages)
+    maximum_output_token = ai.get_maximum_output_token()
     
     tool_size = min(
-        10000, int((context_window - message_size_without_tools) / number_of_tools)
+        10000, int((context_window - message_size_without_tools - maximum_output_token) / number_of_tools)
     )
     
     truncated_conversation_history_without_tools = [
@@ -227,9 +234,8 @@ def handle_issue_conversation(
         "investigation": conversation_request.context.investigation_result.result,
         "tools_called_for_investigation": truncated_investigation_result_tool_calls,
         "conversation_history": truncated_conversation_history_without_tools,
-    }
-    system_prompt = system_prompt_template.render(**template_context)
-    
+    }    
+    system_prompt = load_and_render_prompt("builtin://generic_ask_for_issue_conversation.jinja2", template_context)
     return system_prompt
 
 
@@ -243,6 +249,7 @@ conversation_type_handlers: Dict[
 @app.post("/api/conversation")
 def converstation(conversation_request: ConversationRequest):
     try:
+        load_robusta_api_key()
         ai = config.create_toolcalling_llm(console, allowed_toolsets=ALLOWED_TOOLSETS)
 
         handler = conversation_type_handlers.get(conversation_request.conversation_type)
@@ -252,7 +259,7 @@ def converstation(conversation_request: ConversationRequest):
 
         return ConversationInvestigationResponse(
             analysis=investigation.result,
-            tools=investigation.tool_calls,
+            tool_calls=investigation.tool_calls,
         )
     except AuthenticationError as e:
         raise HTTPException(status_code=401, detail=e.message)
