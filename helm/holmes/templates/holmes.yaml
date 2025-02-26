@@ -14,6 +14,9 @@ spec:
     metadata:
       labels:
         app: holmes
+      annotations:
+        # checksum annotation triggering pod reload when .Values.toolsets changes by helm upgrade
+        checksum/toolset-config: {{ toYaml .Values.toolsets | sha256sum }}
     spec:
       {{- if .Values.customServiceAccountName }}
       serviceAccountName: {{ .Values.customServiceAccountName }}
@@ -42,6 +45,10 @@ spec:
           {{ if .Values.enablePostProcessing -}}
           - name: HOLMES_POST_PROCESSING_PROMPT
             value: {{ .Values.postProcessingPrompt }}
+          - name: ENABLE_TELEMETRY
+            value: {{ .Values.enableTelemetry }}
+          - name: SENTRY_DSN
+            value: {{ .Values.sentryDSN }}
           {{- end }}
           {{- if .Values.additionalEnvVars -}}
           {{ toYaml .Values.additionalEnvVars | nindent 10 }}
