@@ -1,9 +1,11 @@
 import logging
 from typing import List
+
+import requests  # type: ignore
+
+from holmes.core.issue import Issue
 from holmes.core.tool_calling_llm import LLMResult
 from holmes.plugins.interfaces import SourcePlugin
-from holmes.core.issue import Issue
-import requests
 
 
 class GitHubSource(SourcePlugin):
@@ -39,7 +41,7 @@ class GitHubSource(SourcePlugin):
                 response.raise_for_status()
                 data.extend(response.json().get("items", []))
                 links = response.headers.get("Link", "")
-                url = None
+                url = None  # type: ignore
                 for link in links.split(","):
                     if 'rel="next"' in link:
                         url = link.split(";")[0].strip()[1:-1]

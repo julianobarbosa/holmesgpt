@@ -1,81 +1,115 @@
 import logging
 import os
-import yaml
 import os.path
-from typing import Any, Dict, List, Optional, Union
+import threading
+from enum import Enum
+from pathlib import Path
 
-from holmes.core.llm import LLM, DefaultLLM
-from pydantic import FilePath, SecretStr
-from pydash.arrays import concat
+display_logger = logging.getLogger("holmes.display.config")
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
-from holmes.core.runbooks import RunbookManager
-from holmes.core.supabase_dal import SupabaseDal
-from holmes.core.tool_calling_llm import IssueInvestigator, ToolCallingLLM, ToolExecutor
-from holmes.core.tools import (
-    Toolset,
-    ToolsetPattern,
-    ToolsetYamlFromConfig,
-    get_matching_toolsets,
-    ToolsetStatusEnum,
-    ToolsetTag,
+import sentry_sdk
+import yaml  # type: ignore
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    FilePath,
+    PrivateAttr,
+    SecretStr,
 )
-from holmes.plugins.destinations.slack import SlackDestination
-from holmes.plugins.runbooks import load_builtin_runbooks, load_runbooks_from_file
-from holmes.plugins.sources.github import GitHubSource
-from holmes.plugins.sources.jira import JiraSource
-from holmes.plugins.sources.opsgenie import OpsGenieSource
-from holmes.plugins.sources.pagerduty import PagerDutySource
-from holmes.plugins.sources.prometheus.plugin import AlertManagerSource
 
-from holmes.plugins.toolsets import load_builtin_toolsets
-from holmes.utils.pydantic_utils import RobustaBaseConfig, load_model_from_file
-from holmes.utils.definitions import CUSTOM_TOOLSET_LOCATION
-from pydantic import ValidationError
+from holmes.core.init_event import EventCallback, StatusEvent, StatusEventKind
+from holmes.core.llm import DefaultLLM, LLMModelRegistry
+from holmes.core.tools import PrerequisiteCacheMode, Toolset, ToolsetTag
+from holmes.core.tools_utils.tool_executor import ToolExecutor
+from holmes.core.toolset_manager import ToolsetManager
+from holmes.core.transformers.llm_summarize import LLMSummarizeTransformer
+from holmes.plugins.skills.git_skill_repos import (
+    GitSkillRepo,
+    GitSkillRepoManager,
+    parse_skill_repos_env,
+)
+from holmes.plugins.skills.skill_loader import (
+    SkillCatalog,
+    load_skill_catalog,
+)
 
-from holmes.core.tools import YAMLToolset
-from holmes.common.env_vars import ROBUSTA_CONFIG_PATH
+# Source plugin imports moved to their respective create methods to speed up startup
+if TYPE_CHECKING:
+    from holmes.core.tool_calling_llm import ToolCallingLLM
+    from holmes.plugins.destinations.slack import SlackDestination
+    from holmes.plugins.sources.github import GitHubSource
+    from holmes.plugins.sources.jira import JiraServiceManagementSource, JiraSource
+    from holmes.plugins.sources.opsgenie import OpsGenieSource
+    from holmes.plugins.sources.pagerduty import PagerDutySource
+    from holmes.plugins.sources.prometheus.plugin import AlertManagerSource
+
+from holmes.common.env_vars import TOOLSET_STATUS_REFRESH_INTERVAL_SECONDS
+from holmes.core.config import config_path_dir
+from holmes.core.oauth_utils import (
+    eager_load_oauth_tools,
+    preload_oauth_tokens,
+    set_oauth_dal,
+)
+from holmes.core.supabase_dal import SupabaseDal
 from holmes.utils.definitions import RobustaConfig
-import re
-
-DEFAULT_CONFIG_LOCATION = os.path.expanduser("~/.holmes/config.yaml")
-
-
-def get_env_replacement(value: str) -> Optional[str]:
-    env_values = re.findall(r"{{\s*env\.([^\s]*)\s*}}", value)
-    if not env_values:
-        return None
-    env_var_key = env_values[0].strip()
-    if env_var_key not in os.environ:
-        msg = f"ENV var replacement {env_var_key} does not exist for param: {value}"
-        logging.error(msg)
-        raise Exception(msg)
-
-    return os.environ.get(env_var_key)
+from holmes.utils.pydantic_utils import (
+    RobustaBaseConfig,
+    load_model_from_file,
+    parse_model_from_file,
+)
 
 
-def replace_env_vars_values(values: dict[str, Any]) -> dict[str, Any]:
-    for key, value in values.items():
-        if isinstance(value, str):
-            env_var_value = get_env_replacement(value)
-            if env_var_value:
-                values[key] = env_var_value
-        elif isinstance(value, SecretStr):
-            env_var_value = get_env_replacement(value.get_secret_value())
-            if env_var_value:
-                values[key] = SecretStr(env_var_value)
-        elif isinstance(value, dict):
-            replace_env_vars_values(value)
-        elif isinstance(value, list):
-            values[key] = [replace_env_vars_values(iter) for iter in value]
-    return values
+DEFAULT_CONFIG_LOCATION = os.path.join(config_path_dir, "config.yaml")
+
+
+def _parse_custom_skill_paths_env() -> List[str]:
+    raw = os.environ.get("CUSTOM_SKILL_PATHS")
+    if not raw:
+        return []
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _toolset_tool_signature(toolset: Toolset) -> frozenset[tuple[str, str]]:
+    """Stable signature of a toolset's tools for change detection.
+
+    Includes tool name and description so additions, removals, and description
+    edits all trigger an executor swap.
+    """
+    return frozenset(
+        (tool.name, tool.description or "") for tool in (toolset.tools or [])
+    )
+
+
+def _toolset_tools_changed(current: List[Toolset], new: List[Toolset]) -> bool:
+    """Return True if the set of toolsets, or any shared toolset's tool list, changed."""
+    current_by_name = {ts.name: ts for ts in current}
+    new_by_name = {ts.name: ts for ts in new}
+    if current_by_name.keys() != new_by_name.keys():
+        return True
+    for name, new_ts in new_by_name.items():
+        if _toolset_tool_signature(current_by_name[name]) != _toolset_tool_signature(
+            new_ts
+        ):
+            return True
+    return False
+
+
+class SupportedTicketSources(str, Enum):
+    JIRA_SERVICE_MANAGEMENT = "jira-service-management"
+    PAGERDUTY = "pagerduty"
 
 
 class Config(RobustaBaseConfig):
+    model: Optional[str] = None
+    _model_source: Optional[str] = None  # tracks where the model was set from
     api_key: Optional[SecretStr] = (
         None  # if None, read from OPENAI_API_KEY or AZURE_OPENAI_ENDPOINT env var
     )
-    model: Optional[str] = "gpt-4o"
-    max_steps: Optional[int] = 10
+    api_base: Optional[str] = None
+    api_version: Optional[str] = None
+    fast_model: Optional[str] = None
+    max_steps: int = 100
     cluster_name: Optional[str] = None
 
     alertmanager_url: Optional[str] = None
@@ -94,7 +128,7 @@ class Config(RobustaBaseConfig):
     github_owner: Optional[str] = None
     github_pat: Optional[SecretStr] = None
     github_repository: Optional[str] = None
-    github_query: Optional[str] = ""
+    github_query: str = ""
 
     slack_token: Optional[SecretStr] = None
     slack_channel: Optional[str] = None
@@ -107,19 +141,205 @@ class Config(RobustaBaseConfig):
     opsgenie_team_integration_key: Optional[SecretStr] = None
     opsgenie_query: Optional[str] = None
 
-    custom_runbooks: List[FilePath] = []
-    custom_toolsets: List[FilePath] = []
+    custom_skill_paths: List[Union[str, FilePath]] = []
+    # Git repositories to sync skills from (re-pulled periodically by the server's
+    # refresh loop; synced once per run in the CLI). Their checkouts are appended
+    # to the effective skill paths -- see all_skill_paths.
+    skill_repos: List[GitSkillRepo] = []
+
+    # custom_toolsets is passed from config file, and be used to override built-in toolsets, provides 'stable' customized toolset.
+    # The status of custom toolsets can be cached.
+    custom_toolsets: Optional[List[FilePath]] = None
+    # custom_toolsets_from_cli is passed from CLI option `--custom-toolsets` as 'experimental' custom toolsets.
+    # The status of toolset here won't be cached, so the toolset from cli will always be loaded when specified in the CLI.
+    custom_toolsets_from_cli: Optional[List[FilePath]] = None
+    # if True, we will try to load the Robusta AI model, in cli we aren't trying to load it.
+    should_try_robusta_ai: bool = False
+
+    # Ignored by Holmes - exists solely to allow YAML anchors/aliases in config files.
+    # Define reusable blocks here and reference them elsewhere with YAML aliases (*).
+    anchors: Optional[Any] = None
 
     toolsets: Optional[dict[str, dict[str, Any]]] = None
+    mcp_servers: Optional[dict[str, dict[str, Any]]] = None
+    additional_toolsets: Optional[List[Toolset]] = None
 
-    _server_tool_executor: Optional[ToolExecutor] = None
+    # Thread-safe executor cache: stores (executor, cache_key) where cache_key
+    # is (tuple(tags), enable_all_toolsets_possible) so callers with different
+    # parameters don't silently receive a stale executor.
+    _cached_tool_executor: Optional[ToolExecutor] = None
+    _cached_executor_key: Optional[tuple] = None
+    _executor_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
+
+    # TODO: Separate those fields to facade class, this shouldn't be part of the config.
+    _toolset_manager: Optional[ToolsetManager] = PrivateAttr(None)
+    _skill_repo_manager: Optional[GitSkillRepoManager] = PrivateAttr(None)
+    _llm_model_registry: Optional[LLMModelRegistry] = PrivateAttr(None)
+    _dal: Optional[SupabaseDal] = PrivateAttr(None)
+    _config_file_path: Optional[Path] = PrivateAttr(None)
+
+    @property
+    def cached_tool_executor(self) -> Optional[ToolExecutor]:
+        """Thread-safe read access to the cached executor."""
+        with self._executor_lock:
+            return self._cached_tool_executor
+
+    @property
+    def toolset_manager(self) -> ToolsetManager:
+        if not self._toolset_manager:
+            # Set the class-level default once before any transformers are
+            # instantiated.  ToolsetManager no longer needs to know about it.
+            if self.fast_model:
+                LLMSummarizeTransformer.set_default_fast_model(self.fast_model)
+
+            self._toolset_manager = ToolsetManager(
+                toolsets=self.toolsets,
+                mcp_servers=self.mcp_servers,
+                custom_toolsets=self.custom_toolsets,
+                custom_toolsets_from_cli=self.custom_toolsets_from_cli,
+                custom_skill_paths=self.all_skill_paths,
+                config_file_path=self._config_file_path,
+                additional_toolsets=self.additional_toolsets,
+            )
+        return self._toolset_manager
+
+    @property
+    def skill_repo_manager(self) -> GitSkillRepoManager:
+        if not self._skill_repo_manager:
+            # The manager rate-limits itself to the refresh cadence, so callers
+            # (the server refresh loop included) can invoke sync() freely.
+            try:
+                self._skill_repo_manager = GitSkillRepoManager(
+                    self.skill_repos,
+                    min_sync_interval_seconds=TOOLSET_STATUS_REFRESH_INTERVAL_SECONDS,
+                )
+            except ValueError as e:
+                # ValueError specifically, not Exception: the only thing the
+                # constructor rejects is the repo list itself, and a broad catch
+                # would swallow a genuine bug or filesystem fault here and make
+                # git-synced skills quietly vanish instead of surfacing it.
+                #
+                # A rejected repo list (two repos whose names collide -- easy to
+                # hit, since an omitted name is derived from the URL's last
+                # segment, so .../team-a/skills.git and .../team-b/skills.git
+                # both become "skills") must not take out the request path. This
+                # property is reached per request through all_skill_paths, and a
+                # raise here left the failed construction to be retried on every
+                # chat, turning a skills misconfiguration into a total outage.
+                # Serve no git-synced skills instead, and say so.
+                logging.error(
+                    f"Skill repos are misconfigured, so none will be loaded until "
+                    f"this is fixed: {e}"
+                )
+                self._skill_repo_manager = GitSkillRepoManager(
+                    [],
+                    min_sync_interval_seconds=TOOLSET_STATUS_REFRESH_INTERVAL_SECONDS,
+                )
+        return self._skill_repo_manager
+
+    @property
+    def all_skill_paths(self) -> List[Union[str, FilePath]]:
+        """Every path skills load from: configured paths plus git-repo checkouts.
+
+        The repo paths are `current` symlinks that keep pointing at the newest
+        checkout across syncs, so this list is stable even though the content
+        behind it moves. Accessing it clones the repos on first use.
+        """
+        paths: List[Union[str, FilePath]] = list(self.custom_skill_paths)
+        paths.extend(self.skill_repo_manager.skill_paths())
+        return paths
+
+    @property
+    def dal(self) -> SupabaseDal:
+        if not self._dal:
+            self._dal = SupabaseDal(self.cluster_name)  # type: ignore
+        return self._dal
+
+    @property
+    def llm_model_registry(self) -> LLMModelRegistry:
+        with self._executor_lock:
+            if not self._llm_model_registry:
+                self._llm_model_registry = LLMModelRegistry(self, dal=self.dal)
+            return self._llm_model_registry
+
+    def log_useful_info(self):
+        if self.llm_model_registry.models:
+            display_logger.info(
+                f"Loaded models: {list(self.llm_model_registry.models.keys())}"
+            )
+        else:
+            display_logger.warning("No llm models were loaded")
+
+    @classmethod
+    def load_from_file(cls, config_file: Optional[Path], **kwargs) -> "Config":
+        """
+        Load configuration from file and merge with CLI options.
+
+        Args:
+            config_file: Path to configuration file
+            **kwargs: CLI options to override config file values
+
+        Returns:
+            Config instance with merged settings
+        """
+
+        config_from_file: Optional[Config] = None
+        if config_file is not None and config_file.exists():
+            logging.debug(f"Loading config from {config_file}")
+            config_from_file = load_model_from_file(cls, config_file)
+
+        cli_options = {k: v for k, v in kwargs.items() if v is not None and v != []}
+
+        if config_from_file is None:
+            result = cls(**cli_options)
+        else:
+            logging.debug(f"Overriding config from cli options {cli_options}")
+            merged_config = config_from_file.dict()
+            merged_config.update(cli_options)
+            result = cls(**merged_config)
+
+        if config_file is not None and config_file.exists():
+            result._config_file_path = config_file
+
+        # Track where the model setting came from
+        if "model" in cli_options:
+            pass  # CLI --model flag: no source label needed (user just typed it)
+        elif config_from_file is not None and config_from_file.model is not None:
+            result._model_source = f"in {config_file}"
+        # Fall through to env var check below
+
+        result._apply_env_fallbacks()
+
+        result.log_useful_info()
+        return result
+
+    def _apply_env_fallbacks(self) -> None:
+        """Apply MODEL, CUSTOM_SKILL_PATHS and SKILL_REPOS when absent after YAML load/reload."""
+        if self.model is None:
+            model_from_env = os.environ.get("MODEL")
+            if model_from_env and model_from_env.strip():
+                self.model = model_from_env
+                self._model_source = "via $MODEL"
+
+        if not self.custom_skill_paths:
+            skill_paths = _parse_custom_skill_paths_env()
+            if skill_paths:
+                self.custom_skill_paths = skill_paths
+
+        if not self.skill_repos:
+            skill_repos = parse_skill_repos_env()
+            if skill_repos:
+                self.skill_repos = skill_repos
 
     @classmethod
     def load_from_env(cls):
         kwargs = {}
         for field_name in [
             "model",
+            "fast_model",
             "api_key",
+            "api_base",
+            "api_version",
             "max_steps",
             "alertmanager_url",
             "alertmanager_username",
@@ -135,201 +355,382 @@ class Config(RobustaBaseConfig):
             "github_repository",
             "github_pat",
             "github_query",
-            # TODO
-            # custom_runbooks
         ]:
             val = os.getenv(field_name.upper(), None)
             if val is not None:
                 kwargs[field_name] = val
         kwargs["cluster_name"] = Config.__get_cluster_name()
-        return cls(**kwargs)
+        if kwargs["cluster_name"] and not os.environ.get("CLUSTER_NAME"):
+            os.environ["CLUSTER_NAME"] = kwargs["cluster_name"]
+        kwargs["should_try_robusta_ai"] = True
+        result = cls(**kwargs)
+        # CUSTOM_SKILL_PATHS / SKILL_REPOS share one env-fallback path with
+        # load_from_file, so the two loaders cannot drift.
+        result._apply_env_fallbacks()
+        if "model" in kwargs:
+            result._model_source = "via $MODEL"
+        result.log_useful_info()
+        return result
+
+    @staticmethod
+    def get_robusta_global_config_value(key: str) -> Optional[str]:
+        """Read a value from Robusta's global_config. Returns None in CLI mode or on error."""
+        from holmes.common.env_vars import ROBUSTA_CONFIG_PATH
+
+        if not os.path.exists(ROBUSTA_CONFIG_PATH):
+            return None
+        try:
+            with open(ROBUSTA_CONFIG_PATH) as f:
+                yaml_content = yaml.safe_load(f)
+                config = RobustaConfig(**yaml_content)
+                return config.global_config.get(key)
+        except Exception:
+            logging.warning(
+                "Failed to load '%s' from Robusta config", key, exc_info=True
+            )
+            return None
 
     @staticmethod
     def __get_cluster_name() -> Optional[str]:
-        config_file_path = ROBUSTA_CONFIG_PATH
         env_cluster_name = os.environ.get("CLUSTER_NAME")
         if env_cluster_name:
             return env_cluster_name
+        return Config.get_robusta_global_config_value("cluster_name")
 
-        if not os.path.exists(config_file_path):
-            logging.info(f"No robusta config in {config_file_path}")
-            return None
+    def get_skill_catalog(
+        self, user_id: Optional[str] = None, alert_name: Optional[str] = None
+    ) -> Optional[SkillCatalog]:
+        """Build the per-request skill catalog that feeds the system prompt.
 
-        logging.info(f"loading config {config_file_path}")
-        with open(config_file_path) as file:
-            yaml_content = yaml.safe_load(file)
-            config = RobustaConfig(**yaml_content)
-            return config.global_config.get("cluster_name")
+        Rebuilt every request, so this is where the personal tier and the collision hierarchy
+        are applied. `user_id` must be the END USER's id; absent (alert triage, triggered
+        workflows, scheduled prompts) no personal skills load.
 
-        return None
+        The fetch_skill tool's own id list is NOT built here -- that toolset is cached across
+        requests and users, so per-user skills must never be baked into it. SkillsFetcher
+        resolves them at invoke time instead.
+        """
+        # `self.dal` is a lazily-constructing property, so no truthiness guard: the
+        # not-configured case is handled inside get_skill_hierarchy_config, which is
+        # TTL-cached and so adds no round trip per turn.
+        hierarchy = self.dal.get_skill_hierarchy_config()
+        return load_skill_catalog(
+            dal=self.dal,
+            custom_skill_paths=self.all_skill_paths,
+            user_id=user_id,
+            hierarchy=hierarchy,
+            alert_name=alert_name,
+        )
 
-    def create_console_tool_executor(
-        self, allowed_toolsets: ToolsetPattern, dal: Optional[SupabaseDal]
+    # ── Unified factory methods ──
+
+    @staticmethod
+    def _executor_cache_key(tags: List[ToolsetTag], enable_all: bool) -> tuple:
+        return (tuple(sorted(tags, key=lambda t: t.value)), enable_all)
+
+    def create_tool_executor(
+        self,
+        dal: Optional["SupabaseDal"] = None,
+        toolset_tag_filter: Optional[List[ToolsetTag]] = None,
+        enable_all_toolsets_possible: bool = True,
+        prerequisite_cache: PrerequisiteCacheMode = PrerequisiteCacheMode.ENABLED,
+        reuse_executor: bool = False,
+        on_event: EventCallback = None,
     ) -> ToolExecutor:
         """
-        Creates a ToolExecutor instance configured for CLI usage. This executor manages the available tools
-        and their execution in the command-line interface.
+        Create a ToolExecutor with explicit behavioral controls.
 
-        The method loads toolsets in this order, with later sources overriding earlier ones:
-        1. Built-in toolsets (tagged as CORE or CLI)
-        2. Custom toolsets from config files which can override built-in toolsets
-        3. Toolsets defined in self.toolsets which can override both built-in and custom toolsets config
+        Args:
+            dal: Optional database access layer.
+            toolset_tag_filter: Only include toolsets whose tags overlap with this
+                list (e.g. ``[ToolsetTag.CORE, ToolsetTag.CLI]``). Toolsets that
+                don't match any tag are excluded entirely — they won't be loaded,
+                checked, or returned. This filter is independent of
+                ``enable_all_toolsets_possible``: a toolset must pass the tag filter first, then
+                ``enable_all_toolsets_possible`` controls whether it gets enabled automatically.
+                Defaults to ``[ToolsetTag.CORE]`` if not specified.
+            enable_all_toolsets_possible: If True, automatically enable every toolset (that
+                passed the tag filter) that can work without explicit configuration.
+                If False, only toolsets explicitly enabled in config are loaded.
+            prerequisite_cache: Controls prerequisite check caching behavior.
+                DISABLED — run full checks eagerly, no disk caching.
+                ENABLED — use cached results when available (default).
+                FORCE_REFRESH — re-run all checks and update the cache.
+            reuse_executor: If True, cache the executor in memory and return the same
+                instance on subsequent calls with the *same* parameters.
+                A call with different ``toolset_tag_filter`` or
+                ``enable_all_toolsets_possible`` will create and cache a fresh executor.
+
+        Migration from removed helpers
+        ------------------------------
+        ``create_console_tool_executor(dal, refresh_status)``::
+
+            create_tool_executor(
+                dal=dal,
+                toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+                enable_all_toolsets_possible=True,
+                prerequisite_cache=PrerequisiteCacheMode.FORCE_REFRESH if refresh_status else PrerequisiteCacheMode.ENABLED,
+            )
+
+        ``create_agui_tool_executor(dal)``::
+
+            create_tool_executor(
+                dal=dal,
+                toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+                enable_all_toolsets_possible=True,
+                prerequisite_cache=PrerequisiteCacheMode.FORCE_REFRESH,
+                reuse_executor=True,
+            )
+
+        ``refresh_server_tool_executor(dal)``::
+
+            refresh_tool_executor(
+                dal=dal,
+                toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLUSTER],
+                enable_all_toolsets_possible=False,
+            )
         """
-        default_toolsets = [
-            toolset
-            for toolset in load_builtin_toolsets(dal)
-            if any(tag in (ToolsetTag.CORE, ToolsetTag.CLI) for tag in toolset.tags)
-        ]
+        tags = toolset_tag_filter or [ToolsetTag.CORE]
+        cache_key = self._executor_cache_key(tags, enable_all_toolsets_possible)
 
-        # All built-in toolsets are enabled by default, users can override this in their config
-        for toolset in default_toolsets:
-            toolset.enabled = True
+        # Make DAL available for OAuth cross-cluster token storage
+        set_oauth_dal(dal)
 
-        if allowed_toolsets == "*":
-            matching_toolsets = default_toolsets
+        if reuse_executor:
+            with self._executor_lock:
+                if (
+                    self._cached_tool_executor is not None
+                    and self._cached_executor_key == cache_key
+                ):
+                    return self._cached_tool_executor
+                # Build inside the lock to prevent concurrent initialization
+                # for the same cache key
+                toolsets = self.toolset_manager.prepare_toolsets(
+                    dal=dal,
+                    toolset_tag_filter=tags,
+                    enable_all_toolsets_possible=enable_all_toolsets_possible,
+                    prerequisite_cache=prerequisite_cache,
+                    on_event=on_event,
+                )
+                executor = ToolExecutor(toolsets, on_event=on_event)
+                self._cached_tool_executor = executor
+                self._cached_executor_key = cache_key
+
+                preload_oauth_tokens()
+                eager_load_oauth_tools(executor)
+                return executor
+
+        toolsets = self.toolset_manager.prepare_toolsets(
+            dal=dal,
+            toolset_tag_filter=tags,
+            enable_all_toolsets_possible=enable_all_toolsets_possible,
+            prerequisite_cache=prerequisite_cache,
+            on_event=on_event,
+        )
+        preload_oauth_tokens()
+        executor = ToolExecutor(toolsets, on_event=on_event)
+        eager_load_oauth_tools(executor)
+        return executor
+
+    def refresh_tool_executor(
+        self,
+        dal: Optional["SupabaseDal"] = None,
+        toolset_tag_filter: Optional[List[ToolsetTag]] = None,
+        enable_all_toolsets_possible: bool = False,
+    ) -> list[tuple[str, str, str]]:
+        """Refresh the cached tool executor and return a list of toolset status changes.
+
+        Prerequisites are re-checked for every toolset (which, for MCP toolsets,
+        re-fetches the remote tool list). The cached executor is then replaced
+        when either:
+
+        * a toolset's status transitioned (the returned ``changes`` list), or
+        * an existing toolset's tool list changed -- e.g. a remote MCP server
+          added or removed tools while staying healthy -- so the LLM sees the
+          new tools.
+
+        If neither condition holds, the cached executor is left in place.
+        """
+        logging.info(
+            "Refreshing toolsets with tags %s and enable_all_toolsets_possible=%s",
+            toolset_tag_filter,
+            enable_all_toolsets_possible,
+        )
+        # Normalize early so the same tags are used for both loading and caching.
+        tags = toolset_tag_filter or [ToolsetTag.CORE]
+
+        cache_key = self._executor_cache_key(tags, enable_all_toolsets_possible)
+        with self._executor_lock:
+            cached_executor = self._cached_tool_executor
+            cached_key = self._cached_executor_key
+        if not cached_executor or cached_key != cache_key:
+            # Cold start or key mismatch — run live prerequisite checks.
+            # Use DISABLED to avoid writing to disk (server runs on read-only fs).
+            self.create_tool_executor(
+                dal,
+                toolset_tag_filter=tags,
+                enable_all_toolsets_possible=enable_all_toolsets_possible,
+                prerequisite_cache=PrerequisiteCacheMode.DISABLED,
+                reuse_executor=True,
+            )
+            return []
+
+        current_toolsets = cached_executor.toolsets
+
+        new_toolsets, changes = self.toolset_manager.refresh_toolsets_and_get_changes(
+            current_toolsets,
+            dal,
+            toolset_tag_filter=tags,
+            enable_all_toolsets_possible=enable_all_toolsets_possible,
+        )
+
+        if changes or _toolset_tools_changed(current_toolsets, new_toolsets):
+            with self._executor_lock:
+                executor = ToolExecutor(new_toolsets)
+                preload_oauth_tokens()
+                eager_load_oauth_tools(executor)
+                self._cached_tool_executor = executor
+                self._cached_executor_key = cache_key
+
+        return [(name, old.value, new.value) for name, old, new in changes]
+
+    def reload_toolsets(self) -> dict:
+        """Re-read config YAML and rebuild toolsets from scratch.
+
+        Parses the config file into a temporary Config via Pydantic validation,
+        then copies toolset-related fields (toolsets, MCP servers, custom toolsets,
+        additional toolsets, custom skill paths) and resets lazy singletons so the
+        next request rebuilds everything from the fresh values.
+        """
+        fresh = None
+        if self._config_file_path and Path(self._config_file_path).exists():
+            fresh = parse_model_from_file(Config, Path(self._config_file_path))
+
+        with self._executor_lock:
+            if fresh is not None:
+                self.toolsets = fresh.toolsets
+                self.mcp_servers = fresh.mcp_servers
+                self.custom_toolsets = fresh.custom_toolsets
+                self.custom_skill_paths = fresh.custom_skill_paths
+                previous_skill_repos = self.skill_repos
+                self.skill_repos = fresh.skill_repos
+                self.additional_toolsets = fresh.additional_toolsets
+                self._apply_env_fallbacks()
+                # Keep the manager when the repo config is unchanged: it holds
+                # the synced state and cached GitHub App tokens, and dropping it
+                # would force a full network re-sync on the next request.
+                if self.skill_repos != previous_skill_repos:
+                    self._skill_repo_manager = None
+            self._toolset_manager = None
+            self._cached_tool_executor = None
+            self._cached_executor_key = None
+        if fresh is None:
+            logging.warning(
+                "reload_toolsets called without a usable config file (%s); only caches cleared",
+                self._config_file_path,
+            )
         else:
-            matching_toolsets = get_matching_toolsets(
-                default_toolsets, allowed_toolsets.split(",")
-            )
+            logging.info("Toolset config reloaded from %s", self._config_file_path)
+        return {"reloaded": True}
 
-        toolsets_by_name = {toolset.name: toolset for toolset in matching_toolsets}
+    def reload_models(self) -> dict:
+        """Re-read model_list.yaml and model-related config fields, then rebuild the registry.
 
-        toolsets_loaded_from_config = self.load_custom_toolsets_config()
-        if toolsets_loaded_from_config:
-            toolsets_by_name = (
-                self.merge_and_override_bultin_toolsets_with_toolsets_config(
-                    toolsets_loaded_from_config,
-                    toolsets_by_name,
-                )
-            )
-
-        if self.toolsets:
-            loaded_toolsets_from_env = self.load_toolsets_config(self.toolsets, "env")
-            if loaded_toolsets_from_env:
-                toolsets_by_name = (
-                    self.merge_and_override_bultin_toolsets_with_toolsets_config(
-                        loaded_toolsets_from_env,
-                        toolsets_by_name,
-                    )
-                )
-
-        for toolset in toolsets_by_name.values():
-            if toolset.enabled:
-                toolset.check_prerequisites()
-
-        enabled_toolsets = []
-        for ts in toolsets_by_name.values():
-            if ts.get_status() == ToolsetStatusEnum.ENABLED:
-                enabled_toolsets.append(ts)
-                logging.info(f"Loaded toolset {ts.name} from {ts.get_path()}")
-            elif ts.get_status() == ToolsetStatusEnum.DISABLED:
-                logging.info(f"Disabled toolset: {ts.name} from {ts.get_path()}")
-            elif ts.get_status() == ToolsetStatusEnum.FAILED:
-                logging.info(
-                    f"Failed loading toolset {ts.name} from {ts.get_path()}: ({ts.get_error()})"
-                )
-
-        for ts in default_toolsets:
-            if ts.name not in toolsets_by_name.keys():
-                logging.debug(
-                    f"Toolset {ts.name} from {ts.get_path()} was filtered out due to allowed_toolsets value"
-                )
-
-        enabled_tools = concat(*[ts.tools for ts in enabled_toolsets])
-        logging.debug(
-            f"Starting AI session with tools: {[t.name for t in enabled_tools]}"
-        )
-        return ToolExecutor(enabled_toolsets)
-
-    def create_tool_executor(self, dal: Optional[SupabaseDal]) -> ToolExecutor:
+        Re-parses the main config file to pick up changes to model, api_key,
+        api_base, api_version, and fast_model, then resets the lazy registry so
+        the next access constructs a fresh LLMModelRegistry with current values.
         """
-        Creates ToolExecutor for the server endpoints
-        """
+        fresh = None
+        if self._config_file_path and Path(self._config_file_path).exists():
+            fresh = parse_model_from_file(Config, Path(self._config_file_path))
 
-        if self._server_tool_executor:
-            return self._server_tool_executor
-
-        logging.info("Creating server tool executor")
-        all_toolsets = load_builtin_toolsets(dal=dal)
-
-        toolsets_by_name: dict[str, Toolset] = {
-            toolset.name: toolset
-            for toolset in all_toolsets
-            if any(tag in (ToolsetTag.CORE, ToolsetTag.CLUSTER) for tag in toolset.tags)
-        }
-
-        toolsets_loaded_from_config = self.load_custom_toolsets_config()
-        if toolsets_loaded_from_config:
-            toolsets_by_name: Dict[str, Toolset] = (
-                self.merge_and_override_bultin_toolsets_with_toolsets_config(
-                    toolsets_loaded_from_config,
-                    toolsets_by_name,
-                )
+        with self._executor_lock:
+            if fresh is not None:
+                self.model = fresh.model
+                self.api_key = fresh.api_key
+                self.api_base = fresh.api_base
+                self.api_version = fresh.api_version
+                self.fast_model = fresh.fast_model
+                self._apply_env_fallbacks()
+            self._llm_model_registry = None
+        registry = self.llm_model_registry
+        model_count = len(registry.models) if registry.models else 0
+        if fresh is None:
+            logging.warning(
+                "reload_models called without a usable config file (%s); only registry cleared",
+                self._config_file_path,
             )
-
-        if self.toolsets:
-            loaded_toolsets_from_env = self.load_toolsets_config(self.toolsets, "env")
-            if loaded_toolsets_from_env:
-                toolsets_by_name = (
-                    self.merge_and_override_bultin_toolsets_with_toolsets_config(
-                        loaded_toolsets_from_env,
-                        toolsets_by_name,
-                    )
-                )
-
-        toolsets: list[Toolset] = list(toolsets_by_name.values())
-
-        for toolset in toolsets:
-            if toolset.enabled:
-                toolset.check_prerequisites()
-
-        self._server_tool_executor = ToolExecutor(toolsets)
-
-        logging.debug(
-            f"Starting AI session with tools: {[tn for tn in self._server_tool_executor.tools_by_name.keys()]}"
-        )
-
-        return self._server_tool_executor
-
-    def create_console_toolcalling_llm(
-        self, allowed_toolsets: ToolsetPattern, dal: Optional[SupabaseDal] = None
-    ) -> ToolCallingLLM:
-        tool_executor = self.create_console_tool_executor(allowed_toolsets, dal)
-        return ToolCallingLLM(tool_executor, self.max_steps, self._get_llm())
+        else:
+            logging.info("Model config + registry reloaded: %d models", model_count)
+        return {"models_loaded": model_count}
 
     def create_toolcalling_llm(
-        self, dal: Optional[SupabaseDal] = None
-    ) -> ToolCallingLLM:
-        tool_executor = self.create_tool_executor(dal)
-        return ToolCallingLLM(tool_executor, self.max_steps, self._get_llm())
+        self,
+        dal: Optional["SupabaseDal"] = None,
+        toolset_tag_filter: Optional[List[ToolsetTag]] = None,
+        enable_all_toolsets_possible: bool = True,
+        prerequisite_cache: PrerequisiteCacheMode = PrerequisiteCacheMode.ENABLED,
+        reuse_executor: bool = False,
+        model: Optional[str] = None,
+        tracer=None,
+        tool_results_dir: Optional[Path] = None,
+        on_event: EventCallback = None,
+    ) -> "ToolCallingLLM":
+        """
+        Create a ToolCallingLLM with explicit behavioral controls.
 
-    def create_issue_investigator(
-        self, dal: Optional[SupabaseDal] = None
-    ) -> IssueInvestigator:
-        all_runbooks = load_builtin_runbooks()
-        for runbook_path in self.custom_runbooks:
-            all_runbooks.extend(load_runbooks_from_file(runbook_path))
+        Executor parameters (toolset_tag_filter, enable_all_toolsets_possible,
+        prerequisite_cache, reuse_executor) are forwarded to
+        :meth:`create_tool_executor`.
 
-        runbook_manager = RunbookManager(all_runbooks)
-        tool_executor = self.create_tool_executor(dal)
-        return IssueInvestigator(
-            tool_executor, runbook_manager, self.max_steps, self._get_llm()
+        Migration from removed helpers
+        ------------------------------
+        ``create_console_toolcalling_llm(dal, refresh_toolsets, tracer, model_name, tool_results_dir, on_event)``::
+
+            create_toolcalling_llm(
+                dal=dal,
+                toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+                enable_all_toolsets_possible=True,
+                prerequisite_cache=PrerequisiteCacheMode.FORCE_REFRESH if refresh_toolsets else PrerequisiteCacheMode.ENABLED,
+                model=model_name,
+                tracer=tracer,
+                tool_results_dir=tool_results_dir,
+                on_event=on_event,
+            )
+
+        ``create_agui_toolcalling_llm(dal, model, tracer, tool_results_dir)``::
+
+            create_toolcalling_llm(
+                dal=dal,
+                toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+                enable_all_toolsets_possible=True,
+                prerequisite_cache=PrerequisiteCacheMode.FORCE_REFRESH,
+                reuse_executor=True,
+                model=model,
+                tracer=tracer,
+                tool_results_dir=tool_results_dir,
+            )
+        """
+        from holmes.core.tool_calling_llm import ToolCallingLLM
+
+        # Create LLM first so model info appears during toolset loading
+        llm = self._get_llm(model_key=model, tracer=tracer, on_event=on_event)
+        tool_executor = self.create_tool_executor(
+            dal=dal,
+            toolset_tag_filter=toolset_tag_filter,
+            enable_all_toolsets_possible=enable_all_toolsets_possible,
+            prerequisite_cache=prerequisite_cache,
+            reuse_executor=reuse_executor,
+            on_event=on_event,
+        )
+        return ToolCallingLLM(
+            tool_executor,
+            self.max_steps,
+            llm,
+            tool_results_dir=tool_results_dir,
         )
 
-    def create_console_issue_investigator(
-        self, allowed_toolsets: ToolsetPattern, dal: Optional[SupabaseDal] = None
-    ) -> IssueInvestigator:
-        all_runbooks = load_builtin_runbooks()
-        for runbook_path in self.custom_runbooks:
-            all_runbooks.extend(load_runbooks_from_file(runbook_path))
-
-        runbook_manager = RunbookManager(all_runbooks)
-        tool_executor = self.create_console_tool_executor(allowed_toolsets, dal)
-        return IssueInvestigator(
-            tool_executor, runbook_manager, self.max_steps, self._get_llm()
-        )
-
-    def create_jira_source(self) -> JiraSource:
+    def validate_jira_config(self):
         if self.jira_url is None:
             raise ValueError("--jira-url must be specified")
         if not (
@@ -341,15 +742,34 @@ class Config(RobustaBaseConfig):
         if self.jira_api_key is None:
             raise ValueError("--jira-api-key must be specified")
 
+    def create_jira_source(self) -> "JiraSource":
+        from holmes.plugins.sources.jira import JiraSource
+
+        self.validate_jira_config()
+
         return JiraSource(
-            url=self.jira_url,
-            username=self.jira_username,
-            api_key=self.jira_api_key.get_secret_value(),
-            jql_query=self.jira_query,
+            url=self.jira_url,  # type: ignore
+            username=self.jira_username,  # type: ignore
+            api_key=self.jira_api_key.get_secret_value(),  # type: ignore
+            jql_query=self.jira_query,  # type: ignore
         )
 
-    def create_github_source(self) -> GitHubSource:
-        if not (
+    def create_jira_service_management_source(self) -> "JiraServiceManagementSource":
+        from holmes.plugins.sources.jira import JiraServiceManagementSource
+
+        self.validate_jira_config()
+
+        return JiraServiceManagementSource(
+            url=self.jira_url,  # type: ignore
+            username=self.jira_username,  # type: ignore
+            api_key=self.jira_api_key.get_secret_value(),  # type: ignore
+            jql_query=self.jira_query,  # type: ignore
+        )
+
+    def create_github_source(self) -> "GitHubSource":
+        from holmes.plugins.sources.github import GitHubSource
+
+        if not self.github_url or not (
             self.github_url.startswith("http://")
             or self.github_url.startswith("https://")
         ):
@@ -369,23 +789,27 @@ class Config(RobustaBaseConfig):
             query=self.github_query,
         )
 
-    def create_pagerduty_source(self) -> OpsGenieSource:
+    def create_pagerduty_source(self) -> "PagerDutySource":
+        from holmes.plugins.sources.pagerduty import PagerDutySource
+
         if self.pagerduty_api_key is None:
             raise ValueError("--pagerduty-api-key must be specified")
 
         return PagerDutySource(
             api_key=self.pagerduty_api_key.get_secret_value(),
-            user_email=self.pagerduty_user_email,
+            user_email=self.pagerduty_user_email,  # type: ignore
             incident_key=self.pagerduty_incident_key,
         )
 
-    def create_opsgenie_source(self) -> OpsGenieSource:
+    def create_opsgenie_source(self) -> "OpsGenieSource":
+        from holmes.plugins.sources.opsgenie import OpsGenieSource
+
         if self.opsgenie_api_key is None:
             raise ValueError("--opsgenie-api-key must be specified")
 
         return OpsGenieSource(
             api_key=self.opsgenie_api_key.get_secret_value(),
-            query=self.opsgenie_query,
+            query=self.opsgenie_query,  # type: ignore
             team_integration_key=(
                 self.opsgenie_team_integration_key.get_secret_value()
                 if self.opsgenie_team_integration_key
@@ -393,206 +817,193 @@ class Config(RobustaBaseConfig):
             ),
         )
 
-    def create_alertmanager_source(self) -> AlertManagerSource:
+    def create_alertmanager_source(self) -> "AlertManagerSource":
+        from holmes.plugins.sources.prometheus.plugin import AlertManagerSource
+
         return AlertManagerSource(
-            url=self.alertmanager_url,
+            url=self.alertmanager_url,  # type: ignore
             username=self.alertmanager_username,
             password=self.alertmanager_password,
-            alertname_filter=self.alertmanager_alertname,
-            label_filter=self.alertmanager_label,
+            alertname_filter=self.alertmanager_alertname,  # type: ignore
+            label_filter=self.alertmanager_label,  # type: ignore
             filepath=self.alertmanager_file,
         )
 
-    def create_slack_destination(self):
+    def create_slack_destination(self) -> "SlackDestination":
+        from holmes.plugins.destinations.slack import SlackDestination
+
         if self.slack_token is None:
             raise ValueError("--slack-token must be specified")
         if self.slack_channel is None:
             raise ValueError("--slack-channel must be specified")
         return SlackDestination(self.slack_token.get_secret_value(), self.slack_channel)
 
-    def load_custom_toolsets_config(self) -> list[ToolsetYamlFromConfig]:
-        """
-        Loads toolsets config from /etc/holmes/config/custom_toolset.yaml with ToolsetYamlFromConfig class
-        that doesn't have strict validations.
-        Example configuration:
+    @staticmethod
+    def _format_token_count(n: int) -> str:
+        """Format a token count for display: 1048576 → '1M', 32768 → '32K'."""
+        if n >= 1_000_000:
+            value = n / 1_000_000
+            return f"{int(value)}M" if value == int(value) else f"{value:.1f}M"
+        if n >= 1_000:
+            value = n / 1_000
+            return f"{int(value)}K" if value == int(value) else f"{value:.0f}K"
+        return str(n)
 
-        kubernetes/logs:
-            enabled: false
-
-        test/configurations:
-            enabled: true
-            icon_url: "example.com"
-            description: "test_description"
-            docs_url: "https://docs.docker.com/"
-            prerequisites:
-                - env:
-                    - API_ENDPOINT
-                - command: "curl ${API_ENDPOINT}"
-            additional_instructions: "jq -r '.result.results[].userData | fromjson | .text | fromjson | .log'"
-            tools:
-                - name: "curl_example"
-                description: "Perform a curl request to example.com using variables"
-                command: "curl -X GET '{{api_endpoint}}?query={{ query_param }}' "
-        """
-        loaded_toolsets = []
-        for custom_path in self.custom_toolsets:
-            if not os.path.isfile(custom_path):
-                logging.warning(f"Custom toolset file {custom_path} does not exist")
-                continue
-            toolset_config = self.parse_toolsets_file(custom_path, raise_error=False)
-            if toolset_config:
-                loaded_toolsets.extend(toolset_config)
-
-        # if toolsets are loaded from custom_toolsets, return them without checking the default location
-        if loaded_toolsets:
-            return loaded_toolsets
-
-        if not os.path.isfile(CUSTOM_TOOLSET_LOCATION):
-            logging.warning(
-                f"Custom toolset file {CUSTOM_TOOLSET_LOCATION} does not exist"
-            )
-            return []
-
-        return self.parse_toolsets_file(CUSTOM_TOOLSET_LOCATION, raise_error=True)
-
-    def parse_toolsets_file(
-        self, path: str, raise_error: bool = True
-    ) -> Optional[ToolsetYamlFromConfig]:
-        try:
-            with open(path, "r", encoding="utf-8") as file:
-                parsed_yaml = yaml.safe_load(file)
-        except yaml.YAMLError as err:
-            logging.warning(f"Error parsing YAML from {path}: {err}")
-            if raise_error:
-                raise err
-            return None
-        except Exception as err:
-            logging.warning(f"Failed to open toolset file {path}: {err}")
-            if raise_error:
-                raise err
-            return None
-
-        if not parsed_yaml:
-            message = f"No content found in custom toolset file: {path}"
-            logging.warning(message)
-            if raise_error:
-                raise ValueError(message)
-            return None
-
-        if not isinstance(parsed_yaml, dict):
-            message = f"Invalid format: YAML file {path} does not contain a dictionary at the root."
-            logging.warning(message)
-            if raise_error:
-                raise ValueError(message)
-            return None
-
-        toolsets = parsed_yaml.get("toolsets")
-        if not toolsets:
-            message = f"No 'toolsets' key found in: {path}"
-            logging.warning(message)
-            if raise_error:
-                raise ValueError(message)
-            return None
-
-        try:
-            toolset_config = self.load_toolsets_config(toolsets, path)
-        except Exception as err:
-            logging.warning(f"Error loading toolset configuration from {path}: {err}")
-            if raise_error:
-                raise err
-            return None
-
-        return toolset_config
-
-    def load_toolsets_config(
-        self, toolsets: dict[str, dict[str, Any]], path: str
-    ) -> List[ToolsetYamlFromConfig]:
-        loaded_toolsets: list[ToolsetYamlFromConfig] = []
-        if self.is_old_toolset_config(toolsets):
-            message = "Old toolset config format detected, please update to the new format: https://docs.robusta.dev/master/configuration/holmesgpt/custom_toolsets.html"
-            logging.warning(message)
-            raise ValueError(message)
-        for name, config in toolsets.items():
-            try:
-                validated_config: ToolsetYamlFromConfig = ToolsetYamlFromConfig(
-                    **config, name=name
-                )
-                validated_config.set_path(path)
-                if validated_config.config:
-                    validated_config.config = replace_env_vars_values(
-                        validated_config.config
-                    )
-                loaded_toolsets.append(validated_config)
-            except ValidationError as e:
-                logging.warning(f"Toolset '{name}' is invalid: {e}")
-
-            except Exception:
-                logging.warning("Failed to load toolset: %s", name)
-
-        return loaded_toolsets
-
-    def is_old_toolset_config(
-        self, toolsets: Union[dict[str, dict[str, Any]], List[dict[str, Any]]]
-    ) -> bool:
-        # old config is a list of toolsets
-        if isinstance(toolsets, list):
-            return True
-        return False
-
-    def merge_and_override_bultin_toolsets_with_toolsets_config(
+    # TODO: move this to the llm model registry
+    def _get_llm(
         self,
-        toolsets_loaded_from_config: list[ToolsetYamlFromConfig],
-        default_toolsets_by_name: dict[str, YAMLToolset],
-    ) -> dict[str, Toolset]:
-        """
-        Merges and overrides default_toolsets_by_name with custom
-        config from /etc/holmes/config/custom_toolset.yaml
-        """
-        toolsets_with_updated_statuses: Dict[str, YAMLToolset] = {
-            toolset.name: toolset for toolset in default_toolsets_by_name.values()
-        }
-
-        for toolset in toolsets_loaded_from_config:
-            if toolset.name in toolsets_with_updated_statuses.keys():
-                toolsets_with_updated_statuses[toolset.name].override_with(toolset)
-            else:
-                try:
-                    validated_toolset = YAMLToolset(
-                        **toolset.model_dump(exclude_none=True)
-                    )
-                    toolsets_with_updated_statuses[toolset.name] = validated_toolset
-                except Exception as error:
-                    logging.error(
-                        f"Toolset '{toolset.name}' is invalid: {error} ", exc_info=True
-                    )
-
-        return toolsets_with_updated_statuses
-
-    @classmethod
-    def load_from_file(cls, config_file: Optional[str], **kwargs) -> "Config":
-        if config_file is not None:
-            logging.debug("Loading config from file %s", config_file)
-            config_from_file = load_model_from_file(cls, config_file)
-        elif os.path.exists(DEFAULT_CONFIG_LOCATION):
-            logging.debug(
-                f"Loading config from default location {DEFAULT_CONFIG_LOCATION}"
-            )
-            config_from_file = load_model_from_file(cls, DEFAULT_CONFIG_LOCATION)
+        model_key: Optional[str] = None,
+        tracer=None,
+        on_event: EventCallback = None,
+    ) -> "DefaultLLM":
+        sentry_sdk.set_tag("requested_model", model_key)
+        model_entry = self.llm_model_registry.get_model_params(model_key)
+        model_params = model_entry.model_dump(exclude_none=True)
+        api_base = self.api_base
+        api_version = self.api_version
+        is_robusta_model = model_params.pop("is_robusta_model", False)
+        sentry_sdk.set_tag("is_robusta_model", is_robusta_model)
+        if is_robusta_model:
+            # we set here the api_key since it is being refresh when exprided and not as part of the model loading.
+            account_id, token = self.dal.get_ai_credentials()
+            api_key = f"{account_id} {token}"
         else:
-            logging.debug(
-                f"No config file found at {DEFAULT_CONFIG_LOCATION}, using cli settings only"
+            api_key = model_params.pop("api_key", None)
+            if api_key is not None:
+                api_key = api_key.get_secret_value()
+
+        model = model_params.pop("model")
+        # It's ok if the model does not have api base and api version, which are defaults to None.
+        # Handle both api_base and base_url - api_base takes precedence
+        model_api_base = model_params.pop("api_base", None)
+        model_base_url = model_params.pop("base_url", None)
+        api_base = model_api_base or model_base_url or api_base
+        api_version = model_params.pop("api_version", api_version)
+        model_name = model_params.pop("name", None) or model_key or model
+        sentry_sdk.set_tag("model_name", model_name)
+        llm = DefaultLLM(
+            model=model,
+            api_key=api_key,
+            api_base=api_base,
+            api_version=api_version,
+            args=model_params,
+            tracer=tracer,
+            name=model_name,
+            is_robusta_model=is_robusta_model,
+        )  # type: ignore
+        context_size = self._format_token_count(llm.get_context_window_size())
+        max_response = self._format_token_count(llm.get_maximum_output_token())
+        if self._model_source and self._model_source != "default":
+            source_hint = f"configured {self._model_source}"
+        else:
+            source_hint = "default, change with --model, for all options see https://holmesgpt.dev/ai-providers"
+        msg = f"Model: {model_name}, {context_size} context, {max_response} max response ({source_hint})"
+        display_logger.info(msg)
+        if on_event is not None:
+            on_event(
+                StatusEvent(
+                    kind=StatusEventKind.MODEL_LOADED, name=model_name, message=msg
+                )
             )
-            config_from_file = None
+        return llm
 
-        cli_options = {k: v for k, v in kwargs.items() if v is not None and v != []}
+    def get_models_list(self) -> List[str]:
+        if self.llm_model_registry and self.llm_model_registry.models:
+            return list(self.llm_model_registry.models.keys())
 
-        if config_from_file is None:
-            return cls(**cli_options)
+        return []
 
-        merged_config = config_from_file.dict()
-        merged_config.update(cli_options)
-        return cls(**merged_config)
 
-    def _get_llm(self) -> LLM:
-        api_key = self.api_key.get_secret_value() if self.api_key else None
-        return DefaultLLM(self.model, api_key)
+class TicketSource(BaseModel):
+    config: Config
+    output_instructions: list[str]
+    source: Union["JiraServiceManagementSource", "PagerDutySource"]
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+class SourceFactory(BaseModel):
+    @staticmethod
+    def create_source(
+        source: SupportedTicketSources,
+        config_file: Optional[Path],
+        ticket_url: Optional[str],
+        ticket_username: Optional[str],
+        ticket_api_key: Optional[str],
+        ticket_id: Optional[str],
+        model: Optional[str] = None,
+    ) -> TicketSource:
+        from holmes.plugins.sources.jira import JiraServiceManagementSource
+        from holmes.plugins.sources.pagerduty import PagerDutySource
+
+        TicketSource.model_rebuild()
+        supported_sources = [s.value for s in SupportedTicketSources]
+        if source not in supported_sources:
+            raise ValueError(
+                f"Source '{source}' is not supported. Supported sources: {', '.join(supported_sources)}"
+            )
+
+        if source == SupportedTicketSources.JIRA_SERVICE_MANAGEMENT:
+            config = Config.load_from_file(
+                config_file=config_file,
+                api_key=None,
+                model=model,
+                max_steps=None,
+                jira_url=ticket_url,
+                jira_username=ticket_username,
+                jira_api_key=ticket_api_key,
+                jira_query=None,
+                custom_toolsets=None,
+            )
+
+            if not (
+                config.jira_url
+                and config.jira_username
+                and config.jira_api_key
+                and ticket_id
+            ):
+                raise ValueError(
+                    "URL, username, API key, and ticket ID are required for jira-service-management"
+                )
+
+            output_instructions = [
+                "All output links/urls must **always** be of this format : [link text here|http://your.url.here.com] and **never*** the format [link text here](http://your.url.here.com)"
+            ]
+            source_instance = config.create_jira_service_management_source()
+            return TicketSource(
+                config=config,
+                output_instructions=output_instructions,
+                source=source_instance,
+            )
+
+        elif source == SupportedTicketSources.PAGERDUTY:
+            config = Config.load_from_file(
+                config_file=config_file,
+                api_key=None,
+                model=model,
+                max_steps=None,
+                pagerduty_api_key=ticket_api_key,
+                pagerduty_user_email=ticket_username,
+                pagerduty_incident_key=None,
+                custom_toolsets=None,
+            )
+
+            if not (
+                config.pagerduty_user_email and config.pagerduty_api_key and ticket_id
+            ):
+                raise ValueError(
+                    "username, API key, and ticket ID are required for pagerduty"
+                )
+
+            output_instructions = [
+                "All output links/urls must **always** be of this format : \n link text here: http://your.url.here.com\n **never*** use the url the format [link text here](http://your.url.here.com)"
+            ]
+            source_instance = config.create_pagerduty_source()  # type: ignore
+            return TicketSource(
+                config=config,
+                output_instructions=output_instructions,
+                source=source_instance,
+            )
+
+        else:
+            raise NotImplementedError(f"Source '{source}' is not yet implemented")

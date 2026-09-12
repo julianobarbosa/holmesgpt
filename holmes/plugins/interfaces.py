@@ -1,4 +1,5 @@
-from typing import List, Iterable
+from typing import Iterable, List
+
 from holmes.core.issue import Issue
 from holmes.core.tool_calling_llm import LLMResult
 
@@ -6,6 +7,9 @@ from holmes.core.tool_calling_llm import LLMResult
 # Sources must implement this
 class SourcePlugin:
     def fetch_issues(self) -> List[Issue]:
+        raise NotImplementedError()
+
+    def fetch_issue(self, id: str) -> Issue:
         raise NotImplementedError()
 
     # optional
